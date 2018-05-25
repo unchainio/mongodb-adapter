@@ -21,6 +21,9 @@ import (
 	"github.com/casbin/casbin/model"
 	"github.com/casbin/casbin/persist"
 	"gopkg.in/mgo.v2"
+	"github.com/casbin/mongodb-adapter/pkg/xtls"
+	"crypto/tls"
+	"net"
 )
 
 // CasbinRule represents a rule in Casbin.
@@ -36,7 +39,7 @@ type CasbinRule struct {
 
 // adapter represents the MongoDB adapter for policy storage.
 type adapter struct {
-	url        string
+	dialInfo   *mgo.DialInfo
 	session    *mgo.Session
 	collection *mgo.Collection
 	filtered   bool
@@ -47,10 +50,27 @@ func finalizer(a *adapter) {
 	a.close()
 }
 
+type OptionFunc func(*mgo.DialInfo) error
+
 // NewAdapter is the constructor for Adapter. If database name is not provided
 // in the Mongo URL, 'casbin' will be used as database name.
-func NewAdapter(url string) persist.Adapter {
-	a := &adapter{url: url}
+func NewAdapter(url string, optFuncs ...OptionFunc) persist.Adapter {
+	var err error
+
+	opts, err := mgo.ParseURL(url)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, optFunc := range optFuncs {
+		err = optFunc(opts)
+
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	a := &adapter{dialInfo: opts}
 
 	// Open the DB, create it if not existed.
 	a.open()
@@ -68,29 +88,53 @@ func NewFilteredAdapter(url string) persist.FilteredAdapter {
 	return NewAdapter(url).(*adapter)
 }
 
-func (a *adapter) open() {
-	dI, err := mgo.ParseURL(a.url)
-	if err != nil {
-		panic(err)
+func WithTlS(config xtls.KeyPairConfig) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		cert, err := config.X509KeyPair()
+
+		if err != nil {
+			panic(err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: true,
+		}
+
+		i.DialServer = func(addr *mgo.ServerAddr) (net.Conn, error) {
+			return tls.Dial("tcp", addr.String(), tlsConfig)
+		}
+		return nil
 	}
+}
+
+func WithCredentials(user, password string) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		i.Username = user
+		i.Password = password
+		return nil
+	}
+}
+
+func (a *adapter) open() {
 
 	// FailFast will cause connection and query attempts to fail faster when
 	// the server is unavailable, instead of retrying until the configured
 	// timeout period. Note that an unavailable server may silently drop
 	// packets instead of rejecting them, in which case it's impossible to
 	// distinguish it from a slow server, so the timeout stays relevant.
-	dI.FailFast = true
+	a.dialInfo.FailFast = true
 
-	if dI.Database == "" {
-		dI.Database = "casbin"
+	if a.dialInfo.Database == "" {
+		a.dialInfo.Database = "casbin"
 	}
 
-	session, err := mgo.DialWithInfo(dI)
+	session, err := mgo.DialWithInfo(a.dialInfo)
 	if err != nil {
 		panic(err)
 	}
 
-	db := session.DB(dI.Database)
+	db := session.DB(a.dialInfo.Database)
 	collection := db.C("casbin_rule")
 
 	a.session = session
