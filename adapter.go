@@ -15,11 +15,15 @@
 package mongodbadapter
 
 import (
+	"errors"
 	"runtime"
 
 	"github.com/casbin/casbin/model"
 	"github.com/casbin/casbin/persist"
 	"gopkg.in/mgo.v2"
+	"github.com/casbin/mongodb-adapter/pkg/xtls"
+	"crypto/tls"
+	"net"
 )
 
 // CasbinRule represents a rule in Casbin.
@@ -35,9 +39,10 @@ type CasbinRule struct {
 
 // adapter represents the MongoDB adapter for policy storage.
 type adapter struct {
-	url        string
+	dialInfo   *mgo.DialInfo
 	session    *mgo.Session
 	collection *mgo.Collection
+	filtered   bool
 }
 
 // finalizer is the destructor for adapter.
@@ -45,10 +50,27 @@ func finalizer(a *adapter) {
 	a.close()
 }
 
+type OptionFunc func(*mgo.DialInfo) error
+
 // NewAdapter is the constructor for Adapter. If database name is not provided
 // in the Mongo URL, 'casbin' will be used as database name.
-func NewAdapter(url string) persist.Adapter {
-	a := &adapter{url: url}
+func NewAdapter(url string, optFuncs ...OptionFunc) persist.Adapter {
+	var err error
+
+	opts, err := mgo.ParseURL(url)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, optFunc := range optFuncs {
+		err = optFunc(opts)
+
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	a := &adapter{dialInfo: opts}
 
 	// Open the DB, create it if not existed.
 	a.open()
@@ -59,29 +81,74 @@ func NewAdapter(url string) persist.Adapter {
 	return a
 }
 
-func (a *adapter) open() {
-	dI, err := mgo.ParseURL(a.url)
-	if err != nil {
-		panic(err)
+// NewFilteredAdapter is the constructor for FilteredAdapter. Behavior is
+// otherwise indentical to the NewAdapter function.
+func NewFilteredAdapter(url string) persist.FilteredAdapter {
+	// The adapter already supports the new interface, it just needs to be retyped.
+	return NewAdapter(url).(*adapter)
+}
+
+func WithTLS(config *xtls.KeyPairConfig) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		cert, err := config.X509KeyPair()
+
+		if err != nil {
+			panic(err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: true,
+		}
+
+		i.DialServer = func(addr *mgo.ServerAddr) (net.Conn, error) {
+			return tls.Dial("tcp", addr.String(), tlsConfig)
+		}
+		return nil
 	}
+}
+
+func WithCredentials(user, password string) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		i.Username = user
+		i.Password = password
+		return nil
+	}
+}
+
+func WithDatabase(dbName string) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		i.Database = dbName
+		return nil
+	}
+}
+
+func WithServiceHost(serviceHost string) OptionFunc {
+	return func(i *mgo.DialInfo) error {
+		i.ServiceHost = serviceHost
+		return nil
+	}
+}
+
+func (a *adapter) open() {
 
 	// FailFast will cause connection and query attempts to fail faster when
 	// the server is unavailable, instead of retrying until the configured
 	// timeout period. Note that an unavailable server may silently drop
 	// packets instead of rejecting them, in which case it's impossible to
 	// distinguish it from a slow server, so the timeout stays relevant.
-	dI.FailFast = true
+	a.dialInfo.FailFast = true
 
-	if dI.Database == "" {
-		dI.Database = "casbin"
+	if a.dialInfo.Database == "" {
+		a.dialInfo.Database = "casbin"
 	}
 
-	session, err := mgo.DialWithInfo(dI)
+	session, err := mgo.DialWithInfo(a.dialInfo)
 	if err != nil {
 		panic(err)
 	}
 
-	db := session.DB(dI.Database)
+	db := session.DB(a.dialInfo.Database)
 	collection := db.C("casbin_rule")
 
 	a.session = session
@@ -156,13 +223,29 @@ LineEnd:
 
 // LoadPolicy loads policy from database.
 func (a *adapter) LoadPolicy(model model.Model) error {
+	return a.LoadFilteredPolicy(model, nil)
+}
+
+// LoadFilteredPolicy loads matching policy lines from database. If not nil,
+// the filter must be a valid MongoDB selector.
+func (a *adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
+	if filter == nil {
+		a.filtered = false
+	} else {
+		a.filtered = true
+	}
 	line := CasbinRule{}
-	iter := a.collection.Find(nil).Iter()
+	iter := a.collection.Find(filter).Iter()
 	for iter.Next(&line) {
 		loadPolicyLine(line, model)
 	}
 
 	return iter.Close()
+}
+
+// IsFiltered returns true if the loaded policy has been filtered.
+func (a *adapter) IsFiltered() bool {
+	return a.filtered
 }
 
 func savePolicyLine(ptype string, rule []string) CasbinRule {
@@ -194,6 +277,9 @@ func savePolicyLine(ptype string, rule []string) CasbinRule {
 
 // SavePolicy saves policy to database.
 func (a *adapter) SavePolicy(model model.Model) error {
+	if a.filtered {
+		return errors.New("cannot save a filtered policy")
+	}
 	if err := a.dropTable(); err != nil {
 		return err
 	}
@@ -243,22 +329,34 @@ func (a *adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int,
 	selector["ptype"] = ptype
 
 	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) {
-		selector["v0"] = fieldValues[0-fieldIndex]
+		if fieldValues[0-fieldIndex] != "" {
+			selector["v0"] = fieldValues[0-fieldIndex]
+		}
 	}
 	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) {
-		selector["v1"] = fieldValues[1-fieldIndex]
+		if fieldValues[1-fieldIndex] != "" {
+			selector["v1"] = fieldValues[1-fieldIndex]
+		}
 	}
 	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) {
-		selector["v2"] = fieldValues[2-fieldIndex]
+		if fieldValues[2-fieldIndex] != "" {
+			selector["v2"] = fieldValues[2-fieldIndex]
+		}
 	}
 	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) {
-		selector["v3"] = fieldValues[3-fieldIndex]
+		if fieldValues[3-fieldIndex] != "" {
+			selector["v3"] = fieldValues[3-fieldIndex]
+		}
 	}
 	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) {
-		selector["v4"] = fieldValues[4-fieldIndex]
+		if fieldValues[4-fieldIndex] != "" {
+			selector["v4"] = fieldValues[4-fieldIndex]
+		}
 	}
 	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) {
-		selector["v5"] = fieldValues[5-fieldIndex]
+		if fieldValues[5-fieldIndex] != "" {
+			selector["v5"] = fieldValues[5-fieldIndex]
+		}
 	}
 
 	_, err := a.collection.RemoveAll(selector)
