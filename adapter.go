@@ -39,7 +39,7 @@ type CasbinRule struct {
 
 // adapter represents the MongoDB adapter for policy storage.
 type adapter struct {
-	dialInfo   *mgo.DialInfo
+	dialInfo   *DialInfo
 	session    *mgo.Session
 	collection *mgo.Collection
 	filtered   bool
@@ -50,16 +50,25 @@ func finalizer(a *adapter) {
 	a.close()
 }
 
-type OptionFunc func(*mgo.DialInfo) error
+type DialInfo struct {
+	*mgo.DialInfo
+	SessionDatabase string
+}
+
+type OptionFunc func(*DialInfo) error
 
 // NewAdapter is the constructor for Adapter. If database name is not provided
 // in the Mongo URL, 'casbin' will be used as database name.
 func NewAdapter(url string, optFuncs ...OptionFunc) persist.Adapter {
 	var err error
 
-	opts, err := mgo.ParseURL(url)
+	dialInfo, err := mgo.ParseURL(url)
 	if err != nil {
 		panic(err)
+	}
+
+	opts := &DialInfo{
+		DialInfo: dialInfo,
 	}
 
 	for _, optFunc := range optFuncs {
@@ -89,7 +98,7 @@ func NewFilteredAdapter(url string) persist.FilteredAdapter {
 }
 
 func WithTLS(config *xtls.KeyPairConfig) OptionFunc {
-	return func(i *mgo.DialInfo) error {
+	return func(i *DialInfo) error {
 		cert, err := config.X509KeyPair()
 
 		if err != nil {
@@ -109,22 +118,29 @@ func WithTLS(config *xtls.KeyPairConfig) OptionFunc {
 }
 
 func WithCredentials(user, password string) OptionFunc {
-	return func(i *mgo.DialInfo) error {
+	return func(i *DialInfo) error {
 		i.Username = user
 		i.Password = password
 		return nil
 	}
 }
 
-func WithDatabase(dbName string) OptionFunc {
-	return func(i *mgo.DialInfo) error {
+func WithAuthDatabase(dbName string) OptionFunc {
+	return func(i *DialInfo) error {
 		i.Database = dbName
 		return nil
 	}
 }
 
+func WithDatabase(dbName string) OptionFunc {
+	return func(i *DialInfo) error {
+		i.SessionDatabase = dbName
+		return nil
+	}
+}
+
 func WithServiceHost(serviceHost string) OptionFunc {
-	return func(i *mgo.DialInfo) error {
+	return func(i *DialInfo) error {
 		i.ServiceHost = serviceHost
 		return nil
 	}
@@ -143,12 +159,12 @@ func (a *adapter) open() {
 		a.dialInfo.Database = "casbin"
 	}
 
-	session, err := mgo.DialWithInfo(a.dialInfo)
+	session, err := mgo.DialWithInfo(a.dialInfo.DialInfo)
 	if err != nil {
 		panic(err)
 	}
 
-	db := session.DB(a.dialInfo.Database)
+	db := session.DB(a.dialInfo.SessionDatabase)
 	collection := db.C("casbin_rule")
 
 	a.session = session
